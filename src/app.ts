@@ -21,6 +21,9 @@ import * as SessionStore from './session/session-model';
 
 async function main() {
   await sqlite.init();
+  if (process.env.USE_SESSION_DB) {
+    await SessionStore.restore();
+  }
   if (process.env.USE_REDIS) {
     await redis.init();
     await SessionStore.restore();

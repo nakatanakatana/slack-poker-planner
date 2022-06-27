@@ -1,4 +1,5 @@
 import * as redis from '../lib/redis';
+import * as sqlite from '../lib/sqlite';
 import { promisify } from 'util';
 import { ISession } from './isession';
 import logger from '../lib/logger';
@@ -31,43 +32,67 @@ export function findById(id: string): ISession {
  * Restores all the sessions from redis.
  */
 export async function restore(): Promise<void> {
-  if (!process.env.USE_REDIS) return;
+  if (process.env.USE_SESSION_DB) {
+    const db = sqlite.getSingleton();
+    const rawSessions = await db.all(
+      `SELECT
+        value
+      FROM
+        sessions;`
+    )
+    rawSessions.forEach((sessionRow) => {
+      if (!sessionRow) return;
+        try {
+          const session = JSON.parse(sessionRow.value) as ISession;
+          sessions[session.id] = session;
+        } catch (err) {
+          // NOOP
+        }
+    })
 
-  // Scan session keys in redis
-  const client = redis.getSingleton();
-  const scanAsync = promisify(client.scan.bind(client));
-
-  const keys: string[] = [];
-  let cursor = '0';
-
-  do {
-    const response = await scanAsync(cursor, 'MATCH', getRedisKeyMatcher());
-
-    cursor = response[0];
-    keys.push(...response[1]);
-  } while (cursor !== '0');
-
-  // Get these keys
-  if (keys.length > 0) {
-    const mgetAsync = promisify(client.mget.bind(client));
-    const rawSessions: string[] = await mgetAsync(keys);
-
-    rawSessions.forEach((rawSession) => {
-      if (!rawSession) return;
-
-      try {
-        const session = JSON.parse(rawSession) as ISession;
-        sessions[session.id] = session;
-      } catch (err) {
-        // NOOP
-      }
+    logger.info({
+      msg: 'Sessions restored from DB',
+      count: Object.keys(sessions).length,
     });
   }
 
-  logger.info({
-    msg: 'Sessions restored from redis',
-    count: Object.keys(sessions).length,
-  });
+  if (process.env.USE_REDIS) {
+    // Scan session keys in redis
+    const client = redis.getSingleton();
+    const scanAsync = promisify(client.scan.bind(client));
+
+    const keys: string[] = [];
+    let cursor = '0';
+
+    do {
+      const response = await scanAsync(cursor, 'MATCH', getRedisKeyMatcher());
+
+      cursor = response[0];
+      keys.push(...response[1]);
+    } while (cursor !== '0');
+
+    // Get these keys
+    if (keys.length > 0) {
+      const mgetAsync = promisify(client.mget.bind(client));
+      const rawSessions: string[] = await mgetAsync(keys);
+
+      rawSessions.forEach((rawSession) => {
+        if (!rawSession) return;
+
+        try {
+          const session = JSON.parse(rawSession) as ISession;
+          sessions[session.id] = session;
+        } catch (err) {
+          // NOOP
+        }
+      });
+    }
+
+    logger.info({
+      msg: 'Sessions restored from redis',
+      count: Object.keys(sessions).length,
+    });
+  }
 }
 
 /**
@@ -84,7 +109,7 @@ export function upsert(session: ISession) {
   sessions[session.id] = session;
 
   // If using redis, debounce persisting
-  if (process.env.USE_REDIS) {
+  if (process.env.USE_SESSION_DB || process.env.USE_REDIS) {
     if (persistTimeouts[session.id]) clearTimeout(persistTimeouts[session.id]);
     persistTimeouts[session.id] = setTimeout(
       () => persist(session.id),
@@ -97,7 +122,7 @@ export function upsert(session: ISession) {
  * Reads a session from in-memory db, and persists to redis.
  */
 async function persist(sessionId: string) {
-  if (!process.env.USE_REDIS) return;
+  if (!process.env.USE_SESSION_DB && !process.env.USE_REDIS) return;
 
   // Immediately delete the timeout key
   delete persistTimeouts[sessionId];
@@ -112,22 +137,48 @@ async function persist(sessionId: string) {
   const remainingTTL = session.expiresAt - Date.now();
   if (remainingTTL <= 0) return;
 
-  const client = redis.getSingleton();
-  const setAsync = promisify(client.set.bind(client));
-  try {
-    await setAsync(
-      buildRedisKey(session.id),
-      JSON.stringify(session),
-      'PX',
-      remainingTTL
-    );
-  } catch (err) {
-    logger.error({
-      msg: 'Could not persist session',
-      err,
-      session,
-      remainingTTL,
-    });
+  if (process.env.USE_SESSION_DB) {
+    const db = sqlite.getSingleton();
+    await db.run(
+      `INSERT INTO sessions (session_id, value)
+      VALUES (
+        $session_id,
+        $value
+      )
+      ON CONFLICT(session_id)
+      DO UPDATE SET value = $value`,
+      {
+        $session_id: sessionId,
+        $value: JSON.stringify(session),
+      }
+    ).catch(err => {
+      logger.error({
+        msg: 'Could not persist session to DB',
+        err,
+        session,
+        remainingTTL,
+      });
+    })
+  }
+
+  if (process.env.USE_REDIS) {
+    const client = redis.getSingleton();
+    const setAsync = promisify(client.set.bind(client));
+    try {
+      await setAsync(
+        buildRedisKey(session.id),
+        JSON.stringify(session),
+        'PX',
+        remainingTTL
+      );
+    } catch (err) {
+      logger.error({
+        msg: 'Could not persist session',
+        err,
+        session,
+        remainingTTL,
+      });
+    }
   }
 }
 
@@ -136,6 +187,16 @@ async function persist(sessionId: string) {
  */
 export async function remove(id: string) {
   delete sessions[id];
+
+  if (process.env.USE_SESSION_DB) {
+    const db = sqlite.getSingleton();
+    await db.run(
+      `DELETE FROM sessions WHERE session_id = $session_id`,
+      {
+        $session_id: id,
+      }
+    )
+  }
 
   if (process.env.USE_REDIS) {
     const client = redis.getSingleton();
